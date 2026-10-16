@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import copy
+import time
 
 import streamlit as st
 
@@ -12,6 +13,7 @@ from agent.llm import LLMClient
 from config import get_settings
 from ui.chat import render_response
 from ui.sidebar import render_sidebar
+from ui.styles import apply_styles
 from connectors.base import SENSITIVE_COLUMN_TOKENS
 
 st.set_page_config(
@@ -28,27 +30,6 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-
-st.markdown(
-    """
-    <style>
-      :root { --ink:#17223b; --muted:#64748b; --line:#e7edf4; --accent:#176b87; }
-      .block-container {max-width: 1260px; padding-top: 2rem; padding-bottom: 3rem;}
-      [data-testid="stSidebar"] {border-right: 1px solid var(--line);}
-      .hero {padding: 1.35rem 1.6rem; border: 1px solid var(--line); border-radius: 18px;
-        background: linear-gradient(120deg,#f2f8fb 0%,#ffffff 72%); margin-bottom: 1rem;}
-      .hero-kicker {font-size:.76rem; font-weight:700; letter-spacing:.11em; color:var(--accent); text-transform:uppercase;}
-      .hero-title {font-size:2rem; line-height:1.2; font-weight:750; color:var(--ink); margin:.35rem 0;}
-      .hero-copy {font-size:1rem; color:var(--muted); margin:0;}
-      div[data-testid="stChatMessage"] {border:1px solid var(--line); border-radius:14px; padding:.75rem 1rem;}
-      div[data-testid="stChatInput"] {border-color:#cfdae5;}
-      .source-pill {display:inline-block; border:1px solid #c9e2eb; background:#f1f9fb; border-radius:99px;
-        color:#155b72; padding:.3rem .7rem; font-size:.82rem; font-weight:650;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 
 @st.cache_resource
 def _shared_llm_client():
@@ -85,19 +66,21 @@ if previous != active:
     st.session_state.previous_active_source = active
 connector = st.session_state.sources.get(active)
 
+apply_styles(
+    compact=bool(st.session_state.history),
+    theme=st.session_state.get("ui_theme", "Dark"),
+)
 st.markdown(
     '<section class="hero"><div class="hero-kicker">SQL Analyst Agent</div>'
     '<div class="hero-title">Answers you can verify.</div>'
-    '<p class="hero-copy">Ask a business question. Review the SQL and results behind every answer.</p></section>',
+    + ("" if st.session_state.history else '<p class="hero-copy">Ask a business question. Review the SQL and results behind every answer.</p>')
+    + "</section>",
     unsafe_allow_html=True,
 )
 
 if connector:
-    st.markdown(
-        f'<span class="source-pill">Active source · {active}</span>',
-        unsafe_allow_html=True,
-    )
-    if st.button("Refresh schema", key=f"refresh_schema_{active}"):
+    badge, refresh_col, schema_col = st.columns([6, 1.25, 1.5], vertical_alignment="center")
+    if refresh_col.button("Refresh", key=f"refresh_schema_{active}", help="Refresh cached schema metadata"):
         schema = connector.refresh_schema()
         st.session_state.schema_revisions[active] += 1
     else:
@@ -106,6 +89,10 @@ if connector:
             st.session_state.schema_revisions[active],
             connector,
         )
+    badge.markdown(
+        f'<span class="source-pill"><span class="source-dot"></span>{active} · {len(schema.tables)} tables</span>',
+        unsafe_allow_html=True,
+    )
     sensitive_names = [
         column.name
         for table in schema.tables
@@ -118,7 +105,8 @@ if connector:
             + ", ".join(sensitive_names)
         )
 
-    with st.expander(f"Explore schema · {len(schema.tables)} tables", expanded=False):
+    schema_expander = schema_col.popover("Explore schema")
+    with schema_expander:
         for table in schema.tables:
             st.markdown(
                 f"**{table.name}** · {table.row_count if table.row_count is not None else 'unknown'} rows"
@@ -184,32 +172,64 @@ if not st.session_state.history and connector:
             st.session_state.queued_question = question
             st.rerun()
 elif not connector and not st.session_state.history:
-    st.info("Connect a source in the sidebar or load the demo dataset to begin.")
+    st.markdown("### Welcome to SQL Analyst")
+    st.info("Connect a read-only database or load the demo dataset in the sidebar. Then ask a question in plain language.")
+    st.markdown(
+        "Example questions: **Show total revenue by region**, **What were the monthly sales?**, "
+        "**Which customers generated the most revenue?**, **Compare order counts by month**."
+    )
 
 for index, item in enumerate(st.session_state.history):
     with st.chat_message(item["role"]):
         if item["role"] == "assistant":
-            render_response(item["response"], key=f"history_{index}")
+            render_response(
+                item["response"],
+                key=f"history_{index}",
+                runtime_seconds=item.get("runtime_seconds"),
+                model_name=item.get("model_name", "configured model"),
+            )
         else:
             st.markdown(item["content"])
 
-typed_question = st.chat_input("Ask about your data…", disabled=connector is None)
+typed_question = st.chat_input(
+    "Ask a question about your data, e.g. total revenue by region",
+    disabled=connector is None,
+)
 queued_question = st.session_state.pop("queued_question", None)
 question = typed_question or queued_question
 
 if question:
+    st.session_state.last_question = question
     st.session_state.history.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
     with st.chat_message("assistant"):
         try:
+            started = time.perf_counter()
             with st.status(
-                "Understanding question → Selecting data → Writing SQL → Running query",
-                expanded=False,
-            ):
+                "Understanding question · Writing SQL · Running query · Summarising",
+                expanded=True,
+            ) as progress:
+                st.write("Understanding the question")
+                st.write("Selecting tables and writing safe SQL")
+                st.write("Running the query and summarising results")
                 response = st.session_state.agent.ask(question, connector)
-            render_response(response, key=f"turn_{len(st.session_state.history)}")
-            st.session_state.history.append({"role": "assistant", "response": response})
+                progress.update(label="Analysis complete", state="complete", expanded=False)
+            elapsed = time.perf_counter() - started
+            render_response(
+                response,
+                key=f"turn_{len(st.session_state.history)}",
+                runtime_seconds=elapsed,
+                model_name=getattr(st.session_state.llm, "provider", "configured model"),
+            )
+            st.session_state.history.append(
+                {
+                    "role": "assistant",
+                    "response": response,
+                    "runtime_seconds": elapsed,
+                    "model_name": getattr(st.session_state.llm, "provider", "configured model"),
+                }
+            )
         except Exception as exc:
             logging.error("Request failed (error_type=%s).", type(exc).__name__)
             st.error(

@@ -24,6 +24,35 @@ class UploadedFileLike(Protocol):
         """Return uploaded bytes held in session memory."""
 
 
+def _fabric_odbc_connection_string(
+    server: str,
+    database: str,
+    auth_mode: str,
+    client_id: str = "",
+    client_secret: str = "",
+    tenant_id: str = "",
+) -> str:
+    """Build an ODBC string for the supported Fabric Microsoft Entra modes."""
+    def odbc_value(value: str) -> str:
+        return "{" + value.replace("}", "}}") + "}"
+
+    if auth_mode == "Service principal":
+        authentication = (
+            "Authentication=ActiveDirectoryServicePrincipal;"
+            f"UID={odbc_value(client_id)};PWD={odbc_value(client_secret)};"
+            + (f"Authority Id={odbc_value(tenant_id)};" if tenant_id else "")
+        )
+    else:
+        authentication = "Authentication=ActiveDirectoryInteractive;"
+    return (
+        "Driver={ODBC Driver 18 for SQL Server};"
+        f"Server=tcp:{server.strip()},1433;"
+        f"Database={odbc_value(database)};"
+        + authentication
+        + "Encrypt=yes;TrustServerCertificate=no;"
+    )
+
+
 def _store_source(label: str, connector: BaseConnector) -> None:
     """Register a connector without replacing another same-type connection."""
     sources = st.session_state.sources
@@ -112,7 +141,7 @@ def _replacement_conflicts(
 
 def render_sidebar(settings: Settings) -> None:
     """Render connection forms and source management."""
-    st.sidebar.header("Data sources")
+    st.sidebar.header("SQL Analyst")
     if "sources" not in st.session_state:
         st.session_state.sources = {}
     if "source_cache_ids" not in st.session_state:
@@ -123,27 +152,53 @@ def render_sidebar(settings: Settings) -> None:
         st.session_state.source_cache_ids.setdefault(label, uuid4().hex)
         st.session_state.schema_revisions.setdefault(label, 0)
 
-    with st.sidebar.expander("Connect a database", expanded=False):
+    if st.sidebar.button("New chat / Clear conversation", use_container_width=True):
+        st.session_state.history = []
+        if "agent" in st.session_state:
+            st.session_state.agent.memory.clear()
+        st.rerun()
+
+    st.sidebar.markdown("#### 1 · Connect a source")
+    with st.sidebar.expander("Database connection", expanded=False):
         kind = st.selectbox(
             "Database type",
-            ["SQLite", "PostgreSQL", "MySQL", "SQL Server"],
+            ["SQLite", "PostgreSQL", "MySQL", "SQL Server", "Microsoft Fabric"],
             key="db_kind",
         )
         advanced = st.checkbox("Use a full connection string", key="advanced_db")
         connection_string = (
             st.text_input(
-                "SQLAlchemy URL or ODBC connection string",
+                "Connection string",
                 type="password",
                 key="db_connection_string",
                 help=(
-                    "For Microsoft Fabric, select SQL Server and paste its ODBC connection string "
-                    "with Microsoft Entra authentication. The value stays masked."
+                    "Paste a SQLAlchemy URL or complete ODBC connection string. The value stays masked."
                 ),
             )
             if advanced
             else ""
         )
-        if not advanced and kind == "SQLite":
+        tenant_id = ""
+        if not advanced and kind == "Microsoft Fabric":
+            host = st.text_input(
+                "Fabric SQL endpoint", key="fabric_host",
+                help="Use the server hostname shown in Warehouse or Lakehouse SQL endpoint details.",
+                placeholder="workspace.datawarehouse.fabric.microsoft.com",
+            )
+            database = st.text_input("Warehouse or lakehouse SQL database", key="fabric_database")
+            auth_mode = st.selectbox(
+                "Microsoft Entra sign-in",
+                ["Interactive (opens Microsoft sign-in)", "Service principal"],
+                key="fabric_auth_mode",
+            )
+            if auth_mode == "Service principal":
+                tenant_id = st.text_input("Tenant ID", key="fabric_tenant")
+                username = st.text_input("Application (client) ID", key="fabric_client_id")
+                password = st.text_input("Client secret", type="password", key="fabric_client_secret")
+            else:
+                username = password = ""
+            port = 1433
+        elif not advanced and kind == "SQLite":
             path = st.text_input("Existing database file", key="sqlite_path")
         elif not advanced:
             host = st.text_input("Host", key="db_host")
@@ -156,33 +211,43 @@ def render_sidebar(settings: Settings) -> None:
             username = st.text_input("Username", key="db_user")
             password = st.text_input("Password", type="password", key="db_password")
         st.caption(
-            "Use a database account with read-only permissions. Fabric requires Microsoft Entra authentication."
+            "Use a database identity with read-only permissions. Interactive Fabric sign-in may open a Microsoft login window."
         )
         if st.button("Test connection", key="test_db", use_container_width=True):
             connector = None
             stage = "configuration"
             try:
-                with st.spinner("Connecting and inspecting the schema…"):
+                with st.spinner(
+                    "Connecting and inspecting the schema. Interactive Fabric sign-in may open a Microsoft login window…"
+                ):
+                    fabric_connection_string = ""
+                    if not advanced and kind == "Microsoft Fabric":
+                        fabric_connection_string = _fabric_odbc_connection_string(
+                            host,
+                            database,
+                            auth_mode,
+                            username,
+                            password,
+                            tenant_id,
+                        )
                     connector = SQLDatabaseConnector.from_fields(
-                        kind,
+                        "SQL Server" if kind == "Microsoft Fabric" else kind,
                         path=path if not advanced and kind == "SQLite" else "",
                         host=host if not advanced and kind != "SQLite" else "",
                         port=int(port) if not advanced and kind != "SQLite" else None,
                         database=database if not advanced and kind != "SQLite" else "",
                         username=username if not advanced and kind != "SQLite" else "",
                         password=password if not advanced and kind != "SQLite" else "",
-                        connection_string=connection_string,
+                        connection_string=connection_string or fabric_connection_string,
                     )
                     stage = "connection"
                     ok, message = connector.test_connection()
                     if ok:
                         stage = "schema inspection"
                         schema = connector.get_schema()
-                        _store_source(
-                            f"{kind} ({len(schema.tables)} tables)", connector
-                        )
+                        _store_source(kind, connector)
                         st.success(
-                            f"Connected: {len(schema.tables)} tables and {schema.column_count} columns."
+                            f"Connected, {len(schema.tables)} tables, {schema.column_count} columns."
                         )
                     else:
                         connector.close()
@@ -208,7 +273,7 @@ def render_sidebar(settings: Settings) -> None:
                     )
                 else:
                     st.error(
-                        "Could not initialize this connection. For Fabric, use a complete ODBC string with Server, Database, and Authentication=ActiveDirectoryInteractive or ActiveDirectoryServicePrincipal."
+                        "Could not initialize this connection. Check the endpoint, database name, Microsoft Entra permissions, and installed ODBC Driver 18."
                     )
 
     with st.sidebar.expander("Upload files", expanded=False):
@@ -263,9 +328,8 @@ def render_sidebar(settings: Settings) -> None:
             except Exception as exc:
                 st.error(str(exc))
 
-    if st.sidebar.button(
-        "Load sample data", key="load_sample", use_container_width=True
-    ):
+    st.sidebar.caption("Secondary · use the built-in demo dataset")
+    if st.sidebar.button("Load sample data", key="load_sample", use_container_width=True):
         sample = FileDataConnector()
         sample_dir = Path(__file__).resolve().parents[1] / "sample_data"
         try:
@@ -280,17 +344,39 @@ def render_sidebar(settings: Settings) -> None:
             sample.close()
             st.sidebar.error(str(exc))
 
+    st.sidebar.markdown("#### 2 · Active source")
     if st.session_state.sources:
         labels = list(st.session_state.sources)
         selected = st.sidebar.selectbox(
-            "Active source",
+            "Switch active source",
             labels,
             index=labels.index(st.session_state.get("active_source", labels[0])),
             key="active_source_picker",
         )
         st.session_state.active_source = selected
-        st.sidebar.button(
-            "Disconnect active source",
-            use_container_width=True,
-            on_click=_remove_active_source,
+        active_connector = st.session_state.sources.get(selected)
+        with st.sidebar.container(border=True):
+            st.markdown(f"**{selected}**")
+            if active_connector:
+                try:
+                    active_schema = active_connector.get_schema()
+                    st.success(
+                        f"Connected · {len(active_schema.tables)} tables · {active_schema.column_count} columns"
+                    )
+                except Exception:
+                    st.success("Connected")
+            st.button(
+                "Disconnect source",
+                use_container_width=True,
+                on_click=_remove_active_source,
+            )
+
+    st.sidebar.markdown("#### 3 · Settings")
+    with st.sidebar.expander("Result formatting", expanded=False):
+        st.selectbox("Appearance", ["Dark", "Light"], key="ui_theme")
+        st.checkbox(
+            "Indian number grouping (lakh/crore)",
+            key="indian_number_grouping",
+            help="Uses localized display while keeping values numeric and sortable; browser locale controls the exact grouping.",
         )
+        st.selectbox("Currency symbol", ["None", "₹", "$", "€", "£"], key="currency_symbol")
