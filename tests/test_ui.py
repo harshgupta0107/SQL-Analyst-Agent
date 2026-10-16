@@ -13,6 +13,7 @@ def test_fabric_interactive_connection_string():
     assert "Server=tcp:sales.datawarehouse.fabric.microsoft.com,1433" in connection
     assert "Database={SalesWH}" in connection
     assert "Authentication=ActiveDirectoryInteractive" in connection
+    assert "Connection Timeout=10;" in connection
     assert "PWD=" not in connection
 
 

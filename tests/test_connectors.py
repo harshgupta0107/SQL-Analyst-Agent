@@ -134,3 +134,8 @@ def test_fabric_native_connection_string_gets_default_odbc_driver():
     assert wrapped.startswith("Driver={ODBC Driver 18 for SQL Server};")
     assert "Initial Catalog=SampleWarehouse" in wrapped
     c.close()
+
+
+def test_sql_server_connector_has_bounded_odbc_login_timeout():
+    url = URL.create("mssql+pyodbc", query={"odbc_connect": "Driver={ODBC Driver 18 for SQL Server};"})
+    assert SQLDatabaseConnector._connect_args(url) == {"timeout": 10}

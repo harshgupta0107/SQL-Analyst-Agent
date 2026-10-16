@@ -49,7 +49,7 @@ def _fabric_odbc_connection_string(
         f"Server=tcp:{server.strip()},1433;"
         f"Database={odbc_value(database)};"
         + authentication
-        + "Encrypt=yes;TrustServerCertificate=no;"
+        + "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;"
     )
 
 
@@ -218,7 +218,7 @@ def render_sidebar(settings: Settings) -> None:
             stage = "configuration"
             try:
                 with st.spinner(
-                    "Connecting and inspecting the schema. Interactive Fabric sign-in may open a Microsoft login window…"
+                    "Connecting to the database. Complete Microsoft sign-in if prompted..."
                 ):
                     fabric_connection_string = ""
                     if not advanced and kind == "Microsoft Fabric":
@@ -244,7 +244,8 @@ def render_sidebar(settings: Settings) -> None:
                     ok, message = connector.test_connection()
                     if ok:
                         stage = "schema inspection"
-                        schema = connector.get_schema()
+                        with st.spinner("Connected. Loading table and column names…"):
+                            schema = connector.get_schema()
                         _store_source(kind, connector)
                         st.success(
                             f"Connected, {len(schema.tables)} tables, {schema.column_count} columns."

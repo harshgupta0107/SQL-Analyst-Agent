@@ -168,9 +168,13 @@ class SQLDatabaseConnector:
         """Inspect tables and columns without retrieving full table data."""
         if self._schema_cache is not None:
             return self._schema_cache
-        inspector = inspect(self.engine)
         tables: list[TableInfo] = []
         with self.engine.connect() as conn:
+            if self.dialect == "mssql":
+                # Fabric endpoints can be slow to answer data-scanning queries.
+                # Keep inspection metadata-only and bound each ODBC statement.
+                conn.connection.driver_connection.timeout = 10
+            inspector = inspect(conn)
             for name in inspector.get_table_names():
                 pk = set(
                     inspector.get_pk_constraint(name).get("constrained_columns") or []
@@ -192,7 +196,11 @@ class SQLDatabaseConnector:
                     is_text = any(
                         t in str(c["type"]).lower() for t in ("char", "text", "enum")
                     )
-                    if not sensitive and (status_column or is_text):
+                    if (
+                        self.dialect != "mssql"
+                        and not sensitive
+                        and (status_column or is_text)
+                    ):
                         quoted_table = self.engine.dialect.identifier_preparer.quote(
                             name
                         )
@@ -218,7 +226,11 @@ class SQLDatabaseConnector:
                             "money", "number", "date", "time",
                         )
                     )
-                    if not sensitive and is_numeric_or_temporal:
+                    if (
+                        self.dialect != "mssql"
+                        and not sensitive
+                        and is_numeric_or_temporal
+                    ):
                         quoted_table = self.engine.dialect.identifier_preparer.quote(name)
                         quoted_column = self.engine.dialect.identifier_preparer.quote(c["name"])
                         try:
@@ -241,16 +253,21 @@ class SQLDatabaseConnector:
                             value_range=value_range,
                         )
                     )
-                try:
-                    count = int(
-                        conn.execute(
-                            text(
-                                f"SELECT COUNT(*) FROM {self.engine.dialect.identifier_preparer.quote(name)}"
-                            )
-                        ).scalar_one()
-                    )
-                except SQLAlchemyError:
+                if self.dialect == "mssql":
+                    # COUNT(*) can scan large Fabric tables and is not needed to
+                    # connect or formulate safe, schema-aware queries.
                     count = None
+                else:
+                    try:
+                        count = int(
+                            conn.execute(
+                                text(
+                                    f"SELECT COUNT(*) FROM {self.engine.dialect.identifier_preparer.quote(name)}"
+                                )
+                            ).scalar_one()
+                        )
+                    except SQLAlchemyError:
+                        count = None
                 tables.append(TableInfo(name, cols, count))
         self._schema_cache = SchemaInfo(tables)
         return self._schema_cache
