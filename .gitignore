@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/secrets.toml
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
+.venv/
+venv/
+dist/
+build/
